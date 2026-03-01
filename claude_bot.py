@@ -35,7 +35,9 @@ load_dotenv(Path(__file__).parent / _env_file)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 AUTHORIZED_USER_ID = int(os.environ["AUTHORIZED_USER_ID"])
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Local Whisper model for voice transcription (default: "base").
+# Options: tiny, base, small, medium, large-v3
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small").strip()
 # Feature flag for non-essential warning/status messages sent to Telegram.
 WARNINGS_ENABLED = os.getenv("WARNINGS_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 # If CLAUDE_MODEL is set in the env file, this bot is hardwired to that model.
@@ -91,17 +93,27 @@ async def maybe_send_warning(update: Update, text: str):
         log.info(f"Suppressed warning/status message: {text}")
 
 
+def _load_whisper_model():
+    """Load the local Whisper model once at import time."""
+    from faster_whisper import WhisperModel
+    log.info(f"Loading local Whisper model '{WHISPER_MODEL}' ...")
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    log.info("Whisper model loaded.")
+    return model
+
+
+_whisper_model = _load_whisper_model()
+
+
 def transcribe_voice(file_path: str) -> str:
-    """Send audio file to OpenAI Whisper API and return transcript."""
-    import openai
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    with open(file_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model="whisper-1",
-            prompt="Include all words verbatim, including profanity.",
-            file=f,
-        )
-    return result.text
+    """Transcribe audio file using local faster-whisper."""
+    segments, _info = _whisper_model.transcribe(
+        file_path,
+        language="en",
+        beam_size=5,
+        vad_filter=True,
+    )
+    return " ".join(seg.text.strip() for seg in segments)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,10 +122,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Unauthorized voice from {update.effective_user.id}")
         else:
             log.info(f"Unauthorized voice from {update.effective_user.id}")
-        return
-
-    if not OPENAI_API_KEY:
-        await maybe_send_warning(update, "Voice transcription not configured — add OPENAI_API_KEY to .env.")
         return
 
     tmp_path: str | None = None
@@ -148,10 +156,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Unauthorized audio from {update.effective_user.id}")
         else:
             log.info(f"Unauthorized audio from {update.effective_user.id}")
-        return
-
-    if not OPENAI_API_KEY:
-        await maybe_send_warning(update, "Audio transcription not configured — add OPENAI_API_KEY to .env.")
         return
 
     tmp_path: str | None = None
@@ -190,10 +194,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     mime = (doc.mime_type or "").lower() if doc else ""
     if not mime.startswith("audio/"):
-        return
-
-    if not OPENAI_API_KEY:
-        await maybe_send_warning(update, "Audio transcription not configured — add OPENAI_API_KEY to .env.")
         return
 
     tmp_path: str | None = None
@@ -254,7 +254,7 @@ async def _process_message(update: Update, text: str):
             response = await asyncio.to_thread(run_codex, cleaned, BOT_SOURCE)
         else:
             response = await asyncio.to_thread(run_claude, cleaned, BOT_SOURCE, model)
-    await send_response_chunks(update, response)
+    await send_response_chunks(update, response, parse_mode='HTML')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

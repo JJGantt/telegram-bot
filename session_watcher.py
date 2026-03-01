@@ -34,6 +34,16 @@ def _pid_path(session_id: str) -> Path:
     return Path(f"/tmp/claude_watcher_{session_id}.pid")
 
 
+def _token_path(session_id: str) -> Path:
+    """Persisted bot token file — ensures updates route to the correct bot."""
+    return Path(f"/tmp/claude_watcher_{session_id}.token")
+
+
+def _source_path(session_id: str) -> Path:
+    """Persisted source identifier — for logging which bot spawned this session."""
+    return Path(f"/tmp/claude_watcher_{session_id}.source")
+
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
 def notify(msg: str, bot_token: str | None = None):
@@ -53,9 +63,13 @@ def summarize(actions: list[str]) -> str:
         return "working..."
     lines = "\n".join(f"- {a}" for a in actions[-25:])
     prompt = (
-        f"Claude is working on a coding task. Recent actions:\n{lines}\n\n"
-        "Summarize in one sentence, max 15 words. Be specific about what's being "
-        "built or changed. No preamble, no period."
+        f"Claude is working on a task. Here are the tool calls it made:\n{lines}\n\n"
+        "Summarize what Claude is doing in one sentence, max 15 words. "
+        "If you can infer the higher-level goal, describe that (e.g. \"updating the "
+        "Telegram bot config and restarting the service\"). If the actions are too "
+        "ambiguous to infer a goal, just describe what's happening (e.g. \"SSHing "
+        "into the Mac and reading log files\"). Never ask questions. Never say you "
+        "lack context. No preamble, no period."
     )
     try:
         result = subprocess.run(
@@ -183,6 +197,15 @@ def cmd_start():
         sys.exit(0)  # already watching this session
 
     bot_token = os.environ.get("BOT_TOKEN", "")
+
+    # Persist bot token and source to files keyed by session_id.
+    # This ensures the background watcher always routes updates to the
+    # correct bot, even if environment inheritance breaks.
+    if bot_token:
+        _token_path(session_id).write_text(bot_token)
+    if source:
+        _source_path(session_id).write_text(source)
+
     cmd = [sys.executable, __file__, "--watch", transcript_path, session_id]
     if bot_token:
         cmd.extend(["--bot-token", bot_token])
@@ -207,15 +230,24 @@ def cmd_stop():
     if session_id:
         _signal_path(session_id).touch()
         _pid_path(session_id).unlink(missing_ok=True)
+        _token_path(session_id).unlink(missing_ok=True)
+        _source_path(session_id).unlink(missing_ok=True)
     sys.exit(0)
 
 
 def cmd_watch(transcript_path: str, session_id: str, bot_token: str | None = None):
     """Background watcher process."""
+    # If bot_token wasn't passed via CLI, try to read from persisted file.
+    if not bot_token:
+        tf = _token_path(session_id)
+        if tf.exists():
+            bot_token = tf.read_text().strip() or None
     try:
         watch(transcript_path, session_id, bot_token=bot_token)
     finally:
         _pid_path(session_id).unlink(missing_ok=True)
+        _token_path(session_id).unlink(missing_ok=True)
+        _source_path(session_id).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
