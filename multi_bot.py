@@ -10,7 +10,10 @@ Usage:
     python3 multi_bot.py              # Run all bots
     python3 multi_bot.py --bots .env .env-opus   # Run specific bots only
 
-Memory savings: ~200 MB (from ~250 MB down to ~50 MB for the bots).
+Whisper backends (set WHISPER_BACKEND in .env):
+    auto  — use local only when Pi is idle; fall back to API otherwise (default)
+    local — always use local faster-whisper
+    api   — always use OpenAI Whisper API
 """
 
 import asyncio
@@ -45,8 +48,8 @@ TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 # Whisper config — read from main .env at startup
 # ---------------------------------------------------------------------------
 
-def _read_whisper_config() -> tuple[str, str]:
-    """Return (backend, openai_api_key) from the main .env file."""
+def _read_whisper_config() -> tuple[str, str, float]:
+    """Return (backend, openai_api_key, load_threshold) from the main .env file."""
     env_path = Path(__file__).parent / ".env"
     vals = {}
     if env_path.exists():
@@ -55,15 +58,19 @@ def _read_whisper_config() -> tuple[str, str]:
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 vals[k.strip()] = v.strip()
-    backend = vals.get("WHISPER_BACKEND", "local").lower()
+    backend = vals.get("WHISPER_BACKEND", "auto").lower()
     api_key = vals.get("OPENAI_API_KEY", "")
-    return backend, api_key
+    threshold = float(vals.get("WHISPER_LOAD_THRESHOLD", "0.5"))
+    return backend, api_key, threshold
 
-WHISPER_BACKEND, _OPENAI_API_KEY = _read_whisper_config()
-log.info(f"Whisper backend: {WHISPER_BACKEND}")
+WHISPER_BACKEND, _OPENAI_API_KEY, _LOAD_THRESHOLD = _read_whisper_config()
+log.info(f"Whisper backend: {WHISPER_BACKEND} (load threshold: {_LOAD_THRESHOLD})")
+
+# Track how many claude subprocesses are currently running across all bots.
+_active_claude_count = 0
 
 # ---------------------------------------------------------------------------
-# Shared Whisper model (loaded once, used by all bots)
+# Shared Whisper model (loaded on demand, used by all bots)
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
@@ -77,6 +84,15 @@ def _get_whisper_model():
         _whisper_model = WhisperModel(whisper_size, device="cpu", compute_type="int8")
         log.info("Whisper model loaded (shared across all bots).")
     return _whisper_model
+
+
+def _get_load_avg() -> float:
+    """Return 1-minute system load average."""
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 99.0  # fail safe: assume under load
 
 
 def _transcribe_local(file_path: str) -> str:
@@ -98,7 +114,20 @@ def _transcribe_api(file_path: str) -> str:
 def transcribe_voice(file_path: str) -> str:
     if WHISPER_BACKEND == "api":
         return _transcribe_api(file_path)
-    return _transcribe_local(file_path)
+    if WHISPER_BACKEND == "local":
+        return _transcribe_local(file_path)
+    # "auto": use local only when Pi is idle
+    load = _get_load_avg()
+    if load <= _LOAD_THRESHOLD and _active_claude_count == 0:
+        log.info(f"Whisper: using local (load={load:.2f}, active_claude={_active_claude_count})")
+        try:
+            return _transcribe_local(file_path)
+        except Exception as e:
+            log.warning(f"Local Whisper failed, falling back to API: {e}")
+            return _transcribe_api(file_path)
+    else:
+        log.info(f"Whisper: using API (load={load:.2f}, active_claude={_active_claude_count})")
+        return _transcribe_api(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -163,9 +192,19 @@ def make_handlers(cfg: BotConfig):
             await update.message.reply_text("(No response)")
             return
         for i in range(0, len(text), chunk_size):
-            await update.message.reply_text(text[i:i + chunk_size], parse_mode=parse_mode)
+            chunk = text[i:i + chunk_size]
+            try:
+                await update.message.reply_text(chunk, parse_mode=parse_mode)
+            except Exception:
+                if parse_mode:
+                    # Telegram rejected the HTML — fall back to plain text
+                    bot_log.warning("HTML parse failed, retrying as plain text")
+                    await update.message.reply_text(chunk)
+                else:
+                    raise
 
     async def _process_message(update: Update, text: str):
+        global _active_claude_count
         import os as _os
         # Set env vars the runner subprocess needs
         for k, v in cfg.env_vars.items():
@@ -196,10 +235,14 @@ def make_handlers(cfg: BotConfig):
                 parts.append(f"model \u2192 {model}")
             response = "Switched: " + ", ".join(parts) + "."
         else:
-            if mode == "codex":
-                response = await asyncio.to_thread(run_codex, cleaned, cfg.bot_source)
-            else:
-                response = await asyncio.to_thread(run_claude, cleaned, cfg.bot_source, model)
+            _active_claude_count += 1
+            try:
+                if mode == "codex":
+                    response = await asyncio.to_thread(run_codex, cleaned, cfg.bot_source)
+                else:
+                    response = await asyncio.to_thread(run_claude, cleaned, cfg.bot_source, model)
+            finally:
+                _active_claude_count -= 1
         await send_response_chunks(update, response, parse_mode="HTML")
 
     async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,8 +382,8 @@ async def run_all(env_files: list[str]):
     if removed:
         log.info(f"Removed {removed} stale temp audio file(s).")
 
-    # Load Whisper model eagerly so startup cost is paid once (local only)
-    if WHISPER_BACKEND != "api":
+    # Only pre-load Whisper if forced to local mode — in auto/api mode, load on demand
+    if WHISPER_BACKEND == "local":
         _get_whisper_model()
 
     apps = []
