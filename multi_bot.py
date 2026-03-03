@@ -42,6 +42,27 @@ TEMP_FILE_PREFIX = "claude-bot-audio-"
 TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 
 # ---------------------------------------------------------------------------
+# Whisper config — read from main .env at startup
+# ---------------------------------------------------------------------------
+
+def _read_whisper_config() -> tuple[str, str]:
+    """Return (backend, openai_api_key) from the main .env file."""
+    env_path = Path(__file__).parent / ".env"
+    vals = {}
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip()
+    backend = vals.get("WHISPER_BACKEND", "local").lower()
+    api_key = vals.get("OPENAI_API_KEY", "")
+    return backend, api_key
+
+WHISPER_BACKEND, _OPENAI_API_KEY = _read_whisper_config()
+log.info(f"Whisper backend: {WHISPER_BACKEND}")
+
+# ---------------------------------------------------------------------------
 # Shared Whisper model (loaded once, used by all bots)
 # ---------------------------------------------------------------------------
 
@@ -51,19 +72,33 @@ def _get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        whisper_size = "small"
+        whisper_size = "distil-small.en"
         log.info(f"Loading shared Whisper model {whisper_size} ...")
         _whisper_model = WhisperModel(whisper_size, device="cpu", compute_type="int8")
         log.info("Whisper model loaded (shared across all bots).")
     return _whisper_model
 
 
-def transcribe_voice(file_path: str) -> str:
+def _transcribe_local(file_path: str) -> str:
     model = _get_whisper_model()
     segments, _info = model.transcribe(
-        file_path, language="en", beam_size=5, vad_filter=True,
+        file_path, language="en", beam_size=1, vad_filter=True,
     )
     return " ".join(seg.text.strip() for seg in segments)
+
+
+def _transcribe_api(file_path: str) -> str:
+    from openai import OpenAI
+    client = OpenAI(api_key=_OPENAI_API_KEY)
+    with open(file_path, "rb") as f:
+        result = client.audio.transcriptions.create(model="whisper-1", file=f, language="en")
+    return result.text
+
+
+def transcribe_voice(file_path: str) -> str:
+    if WHISPER_BACKEND == "api":
+        return _transcribe_api(file_path)
+    return _transcribe_local(file_path)
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +339,9 @@ async def run_all(env_files: list[str]):
     if removed:
         log.info(f"Removed {removed} stale temp audio file(s).")
 
-    # Load Whisper model eagerly so startup cost is paid once
-    _get_whisper_model()
+    # Load Whisper model eagerly so startup cost is paid once (local only)
+    if WHISPER_BACKEND != "api":
+        _get_whisper_model()
 
     apps = []
     for env_file in env_files:
