@@ -73,7 +73,7 @@ def summarize(actions: list[str]) -> str:
     )
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", "haiku", "--dangerously-skip-permissions"],
+            ["claude", "-p", "--model", "haiku", "--permission-mode", "bypassPermissions"],
             input=prompt, capture_output=True, text=True, timeout=20,
         )
         return (result.stdout or "").strip() or "still working..."
