@@ -2,17 +2,13 @@
 """
 Consolidated Telegram bot — runs ALL bots in a single process.
 
-Instead of 5 separate processes each loading their own Python interpreter,
-libraries, and Whisper model, this runs all bots in one asyncio event loop
-sharing a single Whisper model instance.
-
 Usage:
     python3 multi_bot.py              # Run all bots
     python3 multi_bot.py --bots .env .env-opus   # Run specific bots only
 
 Whisper backends (set WHISPER_BACKEND in .env):
     auto  — use local only when Pi is idle; fall back to API otherwise (default)
-    local — always use local faster-whisper
+    local — always use the shared ai-terminal-server faster-whisper helper
     api   — always use OpenAI Whisper API
 """
 
@@ -20,6 +16,7 @@ import asyncio
 import html
 import logging
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -65,25 +62,18 @@ def _read_whisper_config() -> tuple[str, str, float]:
 
 WHISPER_BACKEND, _OPENAI_API_KEY, _LOAD_THRESHOLD = _read_whisper_config()
 log.info(f"Whisper backend: {WHISPER_BACKEND} (load threshold: {_LOAD_THRESHOLD})")
+_SHARED_WHISPER_SCRIPT = Path("/home/jaredgantt/ai-terminal-server/scripts/transcribe_local.py")
+_SHARED_WHISPER_MODEL = "tiny.en"
+_SHARED_WHISPER_COMPUTE_TYPE = "int8"
+_SHARED_WHISPER_BEAM_SIZE = "1"
+_SHARED_WHISPER_TIMEOUT_S = 90
 
 # Track how many claude subprocesses are currently running across all bots.
 _active_claude_count = 0
 
 # ---------------------------------------------------------------------------
-# Shared Whisper model (loaded on demand, used by all bots)
+# Shared local Whisper path
 # ---------------------------------------------------------------------------
-
-_whisper_model = None
-
-def _get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        whisper_size = "distil-small.en"
-        log.info(f"Loading shared Whisper model {whisper_size} ...")
-        _whisper_model = WhisperModel(whisper_size, device="cpu", compute_type="int8")
-        log.info("Whisper model loaded (shared across all bots).")
-    return _whisper_model
 
 
 def _get_load_avg() -> float:
@@ -96,11 +86,28 @@ def _get_load_avg() -> float:
 
 
 def _transcribe_local(file_path: str) -> str:
-    model = _get_whisper_model()
-    segments, _info = model.transcribe(
-        file_path, language="en", beam_size=1, vad_filter=True,
+    if not _SHARED_WHISPER_SCRIPT.exists():
+        raise RuntimeError(f"shared whisper helper missing: {_SHARED_WHISPER_SCRIPT}")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SHARED_WHISPER_SCRIPT),
+            file_path,
+            _SHARED_WHISPER_MODEL,
+            _SHARED_WHISPER_COMPUTE_TYPE,
+            _SHARED_WHISPER_BEAM_SIZE,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SHARED_WHISPER_TIMEOUT_S,
+        check=False,
     )
-    return " ".join(seg.text.strip() for seg in segments)
+    text = (result.stdout or "").strip()
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip() or "unknown error"
+        raise RuntimeError(f"shared whisper helper failed: {stderr}")
+    return text
 
 
 def _transcribe_api(file_path: str) -> str:
@@ -382,9 +389,8 @@ async def run_all(env_files: list[str]):
     if removed:
         log.info(f"Removed {removed} stale temp audio file(s).")
 
-    # Only pre-load Whisper if forced to local mode — in auto/api mode, load on demand
     if WHISPER_BACKEND == "local":
-        _get_whisper_model()
+        log.info(f"Whisper: using shared helper {_SHARED_WHISPER_SCRIPT}")
 
     apps = []
     for env_file in env_files:
